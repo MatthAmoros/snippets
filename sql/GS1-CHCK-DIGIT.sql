@@ -1,6 +1,6 @@
-USE [erpFrusys]
+USE [TEST]
 GO
-/****** Object:  UserDefinedFunction [dbo].[get_check_digit_gs1_sscc]    Script Date: 24/04/2018 16:40:03 ******/
+/****** Object:  UserDefinedFunction [dbo].[get_check_digit_gs1_sscc]    Script Date: 24/04/2018 16:57:54 ******/
 SET ANSI_NULLS ON
 GO
 SET QUOTED_IDENTIFIER ON
@@ -32,3 +32,4 @@ SET @TOTAL_INTER = (3* CAST(SUBSTRING(@SSCC, 1, 1) AS INTEGER)
          );
   RETURN (10 -(@TOTAL_INTER % 10) % 10)
 END;
+
