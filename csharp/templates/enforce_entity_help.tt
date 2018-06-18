@@ -1,0 +1,5 @@
+[MetadataType(typeof(<#=code.Escape(entity)#>Helper))]
+<#=codeStringGenerator.EntityClassOpening(entity)#>
+{
+  //Generated code by Entity
+}
