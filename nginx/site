@@ -1,0 +1,25 @@
+
+
+# Configuration for Nginx
+server {
+# Configuration for Nginx
+listen 80;
+#Specify domain name or IP Address
+server_name demo.shardsystem.com;
+location / {
+include proxy_params;
+proxy_pass http://unix:/home/ubuntu/shard/shard/app.sock;
+}
+}
+
+
+
+
+
+
+
+
+
+
+
+
