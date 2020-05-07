@@ -4,28 +4,32 @@ import re
 import numpy as np
 import math
 import json
+from json import JSONEncoder
 import datetime
 import glob
 import pytesseract
 
 
+""" Sample job.json
+{
+	"1":{
+			"anchor": {"size": "216", "x":"86", "y":"930", "o":"0", "box":"[[326, 940], [68, 940], [68, 672], [326, 672]]"},
+			"roi_box": "[[326, 310], [200, 310], [200, 252], [326, 252]]",
+			"type":"OCR", "value":"([:0-9.]{5,})", "label":"CSG", "expected_results":"108124, 93872"
+		}
+}
+
+"""
+
 """ Requieres : sudo apt-get install libdmtx0a"""
 from pylibdmtx.pylibdmtx import decode
 
-def crop_image_square(img, crop_size=3):
-	"""
-	Crop image into smaller windows
-	@param crop_size = window size
-	@return an array of cropped windows
-	"""
-	crop_collection = []
-
-	for r in range(0, img.shape[0]):
-		for c in range(0, img.shape[1]):
-			window = img[r:r+crop_size, c:c+crop_size]
-			crop_collection.append(window)
-
-	return crop_collection
+""" Thanks to StackOverFlow for this one """
+class NumpyArrayEncoder(JSONEncoder):
+	def default(self, obj):
+		if isinstance(obj, np.ndarray):
+				return obj.tolist()
+		return JSONEncoder.default(self, obj)
 
 def pre_process_for_DM_heavy(img):
 	"""
@@ -44,83 +48,14 @@ def pre_process_for_OCR(img):
 	"""
 	Resize and binarize image
 	@param img = Grayscale image
-	@return : 600x300 binarized image
+	@return : binarized image
 	"""
 
 	## Threshold
-	_, thresh = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-	kernel = np.ones((1,1),np.uint8)
-	erode = cv2.erode(thresh, kernel, iterations = 1)
-	return erode
+	blurred = cv2.GaussianBlur(img,(3,3),0.3)
+	_, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-def filter_out_big_elements(img, count_biggest = 10):
-	"""
-	Filter out small elements
-	@param img = Thinned image
-	@param size = Element size
-	@return filtered image, and flag indicating if DM presence is possible
-	"""
-	dm_possible = False
-	_, contours, hierarchy = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-	""" Get contours surfaces """
-	areas = [cv2.contourArea(c) for c in contours]
-	""" If there is only one countour, there is no DM detected """
-	areas.sort(reverse=True)
-	for cnt in range(len(areas)):
-		if(cnt < count_biggest):
-			cv2.drawContours(img, [contours[cnt]], 0, (0,0,0), -1)
-
-	return img
-
-def filter_out_small_elements(img, size=200):
-	"""
-	Filter out small elements
-	@param img = Thinned image
-	@param size = Element size
-	@return filtered image, and flag indicating if DM presence is possible
-	"""
-	dm_possible = False
-	_, contours, hierarchy = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-	""" Get contours surfaces """
-	areas = [cv2.contourArea(c) for c in contours]
-	""" If there is only one countour, there is no DM detected """
-
-	if len(areas) > 1:
-		for cnt in range(len(areas)):
-			if(areas[cnt] < size):
-				cv2.drawContours(img, [contours[cnt]], 0, (0,255,0), -1)
-
-		dm_possible = True
-
-	return img, dm_possible
-
-def get_external_contour(img, margin=1):
-	"""
-	Get external object borders
-	@param img = Thinned image
-	@param margin = Applied margin
-	@return bounding box
-	"""
-	""" Finding bounding box """
-	""" Blur to smooth contours """
-	blurred = cv2.blur(img,(20,20))
-	_, contours, hierarchy = cv2.findContours(blurred, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-	""" Get biggest contours """
-	areas = [cv2.contourArea(c) for c in contours]
-	max_index = np.argmax(areas)
-	cnt=contours[max_index]
-
-	""" x, y, w, h of bounding rectangle """
-	bounding_box = cv2.minAreaRect(cnt)
-	bounding_box = cv2.boxPoints(bounding_box)
-	bounding_box = np.int0(bounding_box)
-
-	""" Apply margin """
-	bounding_box = bounding_box * margin
-	bounding_box = np.int0(bounding_box)
-
-	return bounding_box
+	return thresh
 
 def prepare_image(img):
 	"""
@@ -141,23 +76,25 @@ def prepare_image(img):
 
 	""" Bottom hat filter """
 	""" SE size should be 2 x module size to detect silence zone """
-	kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(25,25))
+	kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(50,50))
 	open =  cv2.morphologyEx(blurred, cv2.MORPH_BLACKHAT, kernel)
 
+	mask, possible_matches = get_mask_for_DM(open, kernel)
 
 	""" Try again with SE rotated """
-	if possible_matches == 0:
+	angle_step = 30
+	current_angle = angle_step
+	while possible_matches == 0 and current_angle < 180:
 		print("DM Mask not found, rotating SE")
-		kernel_rotated = rotate_element(kernel, 90)
+		kernel_rotated = rotate_element(kernel, current_angle)
 		open =  cv2.morphologyEx(blurred, cv2.MORPH_BLACKHAT, kernel_rotated)
-		mask, possible_matches = get_mask_for_DM(open)
-
-	cv2.imwrite('./output/pre_DM.png', mask * img)
+		mask, possible_matches = get_mask_for_DM(open, kernel_rotated)
+		current_angle = current_angle + angle_step
 
 	""" Apply to original image """
 	return mask * img
 
-def get_mask_for_DM(img):
+def get_mask_for_DM(img, kernel):
 	"""
 	Try to detect possible ROI for datamatrix
 	Using algorithm from :
@@ -184,9 +121,9 @@ def get_mask_for_DM(img):
 	""" Production parameters regarding average and minimum area """
 	tolerance = 1
 	""" 1% of total area """
-	min_area =0.01* h * w
+	min_area = 0.01 * h * w
 	""" 25% of total area """
-	max_area =0.25* h * w
+	max_area = 0.25 * h * w
 	convex_defect_limit = 10
 
 	index = 0
@@ -202,7 +139,6 @@ def get_mask_for_DM(img):
 
 	""" Convert to uint 8 matrix """
 	distance = distance.astype(np.uint8)
-	cv2.imwrite('./output/pre_DM.png', distance * 255)
 	""" Initialize mask """
 	mask = distance * 0
 	_, cnts, _ = cv2.findContours(distance, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -238,8 +174,6 @@ def rotate_element(element, angle):
 	(cx,cy) = (w/2,h/2)
 
 	M = cv2.getRotationMatrix2D((cx,cy),-angle,1.0)
-	print(M.shape)
-	print(M)
 
 	cos = np.abs(M[0,0])
 	sin = np.abs(M[0,1])
@@ -251,6 +185,12 @@ def rotate_element(element, angle):
 	M[1,2] += (nH/2) - cy
 
 	return cv2.warpAffine(element,M,(nW,nH))
+
+def rotate_image(image, angle):
+	image_center = tuple(np.array(image.shape[1::-1]) / 2)
+	rot_mat = cv2.getRotationMatrix2D(image_center, angle, 1.0)
+	result = cv2.warpAffine(image, rot_mat, image.shape[1::-1], flags=cv2.INTER_AREA)
+	return result
 
 def is_point_in_rectangle(point, rectangle):
 	"""
@@ -275,69 +215,25 @@ def execute_from_file(image_path):
 	img = cv2.imread(image_path, 0)
 	""" Standard sizing """
 	img = cv2.resize(img, (2000, 1000))
-	""" Prepare for OCR and DM detection """
-	#prepared = prepare_image(img)
-
 	shrinked = cv2.resize(img, (600, 300))
 
 	""" Binarize """
-	pre_for_DM, dm_possible = pre_process_for_DM_heavy(shrinked)
-
-	""" Get scaling rate """
-	height, width = pre_for_DM.shape[:2]
-	original_h, original_w = img.shape[:2]
-
-	y_scaling = original_h / height
-	x_scaling = original_w / width
+	pre_for_DM, dm_possible = pre_process_for_DM_heavy(img)
 
 	""" Filter small element (avoid noise), DM should be big enough to be detected """
-	anchor = get_anchor_properties_from_DM(pre_for_DM, dm_possible)
+	anchor, orientation = get_anchor_properties_from_DM(pre_for_DM, dm_possible)
 
-	""" Scale according to original image """
-	anchor = (int(anchor[0] * x_scaling), int(anchor[1] * y_scaling), anchor[2], anchor[3] * x_scaling)
-
-	""" Show anchor """
-	cv2.circle(img, (anchor[0], anchor[1]), 5, (128,128,128), -1)
-
-	envelop = get_dm_envelop(anchor, img)
-	anchor = (anchor[0], anchor[1], anchor[2], anchor[3], envelop)
-
-	print("Current anchor: " + str(anchor))
 	detection = np.copy(img)
+
 	""" Iterate over jobs and process them """
 	for filename in glob.glob('./jobs/*.json'):
 		with open(filename) as job_file:
 			job = json.load(job_file)
-			detection = process_job(anchor, detection, job, filename)
+			detection = process_job(anchor, orientation, detection, job, filename)
 
 	cv2.imwrite('./output/detection.png', detection)
 
-def get_dm_envelop(anchor, img):
-	""" Anchor is bottom left point """
-	""" (x1, y1, orientation, size) """
-	blurred = cv2.blur(img,(5,5))
-
-	box = None
-
-	margin_x, margin_y = 7,7
-	width, height = 1, 1
-	x_a, y_a, _, _ = anchor
-	env = None
-
-	while blurred[y_a - margin_y - height][x_a + margin_x + width] <= 100:
-		width = width + 1
-
-	env = (width + margin_x, 0)
-
-	width, height = 1, 1
-	while blurred[y_a - margin_y - height][x_a + margin_x + width] <= 100:
-		height = height + 1
-
-	env = (env[0], height - margin_y)
-
-	return env
-
-def get_tesseract_result(job_roi, img, pattern, deviation):
+def get_tesseract_result(job_roi, img, pattern, deviation, label='', expected_results=None):
 	"""
 	Call tesseract to get string results
 	@param img = image
@@ -345,76 +241,128 @@ def get_tesseract_result(job_roi, img, pattern, deviation):
 	"""
 	""" Call Tessaract to get strings """
 	a = datetime.datetime.now()
-	""" Max 10 iterrations """
-	MAX_ITERATIONS = 5
+
+	""" Max iterrations """
+	MAX_ITERATIONS = 2
+
 	""" Shifting step """
-	MOVE_STEP = 7
+	MOVE_STEP = 20
+	INITIAL_SHIFT = 40
+
+	""" Prepare image for OCR """
 	OCR_fitted = np.copy(img)
 	OCR_fitted = pre_process_for_OCR(OCR_fitted)
-	cv2.imwrite("./output/pre_OCR.png", OCR_fitted)
-
-	new_roi = job_roi
-
-	""" Extract ROI, revert if needed  """
-	if job_roi[0] > job_roi[2]:
-		new_roi = (job_roi[2], new_roi[1], job_roi[0], new_roi[3])
-
-	if job_roi[1] > job_roi[3]:
-		new_roi = (new_roi[0], job_roi[3], new_roi[2], job_roi[1])
-
-	roi_img = OCR_fitted[new_roi[0]:new_roi[2]+1, new_roi[1]:new_roi[3]+1]
 
 	""" OEM: 3 - Default /  PSM: 7- Single line  """
 	custom_config = r'--oem 3 --psm 7'
 
-	string = pytesseract.image_to_string(roi_img, config=custom_config)
 	""" Initialize iteration """
-	if deviation > 0:
-		iteration = deviation
-	else:
-		iteration = 1
+	iteration = 0
 
 	new_roi = job_roi
+	roi_img = None
+	string = ""
 	upper_bound_reached = False
-	while re.match(pattern, string) is None and iteration < MAX_ITERATIONS:
+	result = None
+	axis = 'x'
+	revert = False
+	cycles = 0
+	""" Result not matching regex """
+	""" Result not in expected results """
+	""" MAX_ITERATIONS reached """
+	while result is None \
+	or (len(expected_results) > 1 and string not in expected_results):
 		""" Not found or multiple found """
 		""" Let's shift ROI """
 		""" Extract ROI  """
-		if iteration > MAX_ITERATIONS / 2 and not upper_bound_reached:
-			new_roi = (
-						job_roi[0] - iteration * MOVE_STEP,
-						job_roi[1] - iteration * MOVE_STEP,
-						job_roi[2] - iteration * MOVE_STEP,
-						job_roi[3] - iteration * MOVE_STEP
-						)
-			""" Replace negatives with 0 and out of bound """
-			new_roi = filter_out_negatives_and_out_of_bound(new_roi, (1000, 2000))
-		else:
-			new_roi = (
-						job_roi[0] + iteration * MOVE_STEP,
-						job_roi[1] + iteration * MOVE_STEP,
-						job_roi[2] + iteration * MOVE_STEP,
-						job_roi[3] + iteration * MOVE_STEP
-						)
-			new_roi = filter_out_negatives_and_out_of_bound(new_roi, (1000, 2000))
+		""" Horizontal shift """
+		if cycles >= 2:
+			break
 
-		roi_img = img[new_roi[1]:new_roi[3], new_roi[0]:new_roi[2]]
+		if iteration * MOVE_STEP == INITIAL_SHIFT:
+			revert = axis == 'y'
+			if revert:
+				cycles = cycles + 1
+				""" Revert """
+				axis = 'x'
+				iteration = 1
+				new_roi[:,1] = new_roi[:,1] - INITIAL_SHIFT
+
+				INITIAL_SHIFT = -INITIAL_SHIFT
+				MOVE_STEP = -MOVE_STEP
+			else:
+				""" Change axis """
+				axis = 'y'
+				iteration = 1
+				new_roi[:,0] = new_roi[:,0] - INITIAL_SHIFT
+
+		if axis == 'x':
+			if iteration == 1:
+				new_roi[:,0] = new_roi[:,0] + INITIAL_SHIFT
+			if iteration > 0:
+				new_roi[:,0] = new_roi[:,0] - iteration * MOVE_STEP
+
+		if axis == 'y':
+			if iteration == 1:
+				new_roi[:,1] = new_roi[:,1] + INITIAL_SHIFT
+			if iteration > 0:
+				new_roi[:,1] = new_roi[:,1] - iteration * MOVE_STEP
+
+		print("Shifting " + axis + ": " + str(iteration * MOVE_STEP))
+
+		""" Bound ROI and extract points """
+		new_roi = bound_np_array(new_roi, 2000, 1000)
+
+		roi_img = crop_roi(new_roi, OCR_fitted)
+
 		iteration = iteration + 1
+
 		string = pytesseract.image_to_string(roi_img, config=custom_config)
+		result = re.match(pattern, string)
 
 	""" Found <> MAX ITERATION """
-	found = iteration == MAX_ITERATIONS
+	found = iteration < MAX_ITERATIONS
 
 	if found:
-		print("ROI not found.")
-	else:
-		print("ROI found in " + str(iteration) + " iterations.")
+		print("ROI found in " + str(iteration - deviation) + " iterations.")
 		""" Save deviation """
 		deviation = iteration
+	else:
+		print("ROI not found")
+
+	if roi_img is not None:
+		cv2.imwrite("./output/pre_OCR_ " + label + ".png", roi_img)
+
 	b = datetime.datetime.now()
 	print("OCR done in: " + str(b - a))
 
 	return string, new_roi, found, deviation
+
+def crop_roi(roi, img):
+	rect = cv2.minAreaRect(roi)
+
+	box = cv2.boxPoints(rect)
+	box = np.int0(box)
+
+	width = int(rect[1][0])
+	height = int(rect[1][1])
+
+	src_pts = box.astype("float32")
+
+	dst_pts = np.array([
+						[height-1, width-1],
+						[0, width-1],
+	                    [0, 0],
+	                    [height-1, 0]
+	                    ], dtype="float32")
+
+	# the perspective transformation matrix
+	M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+
+	# directly warp the rotated rectangle to get the straightened rectangle
+	warped = cv2.warpPerspective(img, M, (height, width))
+
+	return warped
 
 def get_anchor_properties_from_DM(img, dm_possible):
 	if dm_possible:
@@ -433,37 +381,30 @@ def get_anchor_properties_from_DM(img, dm_possible):
 		""" DM will be our anchor """
 		""" Here we try to find it's size and if it's tilted in some way """
 		""" We assume that DM is always square and paralele to label lower bounds """
-		x1, y1, x2, y2, x3, y3, x4, y4 = (dm_rect.left,
-							height - dm_rect.top,
+		_, cnts, _ = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+		hull = None
+		""" Get contours surfaces """
+		for c in cnts:
+			""" Get approx polynome """
+			approx = cv2.approxPolyDP(c,0.01*cv2.arcLength(c,True),True)
+			""" Calculate convex hull """
+			hull = cv2.convexHull(approx,returnPoints = True)
 
-							dm_rect.left,
-							height - dm_rect.top - dm_rect.height,
+		""" Get angle from contour and minAreaRect, should returns angle from origin, store box points """
+		DM_area = cv2.minAreaRect(hull)
 
-							dm_rect.left + dm_rect.width,
-							height - dm_rect.top,
+		""" Get box points """
+		box = cv2.boxPoints(DM_area)
+		box = np.int0(box)
 
-							dm_rect.left + dm_rect.width,
-							height - dm_rect.top - dm_rect.height,
-							)
-		cont = np.array([
-						[x1,  y1],
-						[x2,  y2],
-						[x3,  y3],
-						[x4,  y4]
-						])
-		""" Squared DM """
-		size = x2 - x1
-		""" Get angle from contour and minAreaRect, should returns angle from origin """
-		DM_area = cv2.minAreaRect(cont)
-
-		orientation = abs(DM_area[2]) % 45
+		orientation = abs(DM_area[2])
 	else:
 		""" No DM detected, return origin as anchor """
 		x1, y1, orientation, size, box = (0,0,60,50, None)
 
-	return (x1, y1, orientation, size)
+	return box, orientation
 
-def process_job(detected_anchor, img, job, file_path):
+def process_job(detected_anchor, orientation, img, job, file_path):
 	"""
 	Process job file on current picture
 	@param anchor = Current scene anchor
@@ -475,61 +416,72 @@ def process_job(detected_anchor, img, job, file_path):
 	print("Processing job " + file_path)
 	detection = np.copy(img)
 	deviation = 0
+	h, w = img.shape[:2]
 
 	for item_i in job:
 		item = job[item_i]
 		if 'type' in item:
 			if item['type'] == 'OCR':
-				job_roi = extract_roi_from_job(item, detected_anchor)
-
+				job_roi = extract_roi_from_job(item, detected_anchor, orientation)
+				label = item['label']
 				pattern_for_re = item['value'].replace('\\\\', '\\')
-				result, job_roi, found, deviation = get_tesseract_result(job_roi, img, pattern_for_re, deviation)
+				expected_results = item['expected_results'].split(',')
 
-				cv2.rectangle(detection, (job_roi[0],job_roi[1]), (job_roi[2],job_roi[3]), (0,255,0), 3)
-				print(item['label'] + " " + result)
+				""" Bounding / Casting to int """
+				job_roi = bound_np_array(job_roi, h, w)
 
+				result, job_roi, found, deviation = get_tesseract_result(job_roi, img, pattern_for_re, deviation, label=label, expected_results=expected_results)
+				rect = get_rect_from_np_coords(job_roi)
+
+				cv2.rectangle(detection, (rect[0], rect[1]), (rect[0] + rect[2], rect[1] + rect[3]), (128,128,128), 3)
+
+				print( label + " " + result)
 	return detection
 
-def extract_roi_from_job(item, detected_anchor):
-	x1, y1, x2, y2 = (0, 0, 0, 0)
+def bound_np_array(np_array, h, w):
+	np_array[np_array < 0] = 0
+	bound_h = np_array[:,0]
+	bound_w = np_array[:,1]
 
-	""" Unpack detected anchor """
-	a_x, a_y, a_width, a_height = (detected_anchor[0], detected_anchor[1], detected_anchor[4][0], detected_anchor[4][1])
-	rotation = detected_anchor[2]
-	anchor_size = int(detected_anchor[3])
+	bound_h[bound_h > h] = h
+	bound_w[bound_w > w] = w
 
-	if 'anchor' in item:
-		""" Apply size rate """
-		size_rate = anchor_size / int(item['anchor']['size'])
-		"""" Item anchor pos """
-		i_a_x, i_a_y = int(item['anchor']['x']), int(item['anchor']['y'])
+	np_array[:,0] = bound_h
+	np_array[:,1] = bound_w
+	np_array = np.round(np_array)
+	np_array = np_array.astype(np.uint0)
 
-	if 'rect' in item:
-		""" Unpack rectangle """
-		""" (r_x1, r_y1) top-left corner """
-		""" (r_x2, r_y2) bottom right corner """
-		r_x1, r_y1, r_x2, r_y2 = (int(item['rect']['x1']), int(item['rect']['y1']), int(item['rect']['x2']), int(item['rect']['y2']))
+	return np_array
 
-		""" As np arrays """
-		rect_1 = np.array([r_x1, r_y1, 1])
-		rect_2 = np.array([r_x2, r_y2, 1])
+def get_rect_from_np_coords(coords):
+	""" Get top left corner """
+	x, y, h, w = np.amin(coords[:,0]), \
+	 			np.amin(coords[:,1]), \
+				np.amax(coords[:,0]) - np.amin(coords[:,0]), \
+				np.amax(coords[:,1]) - np.amin(coords[:,1])
 
-		pts_src = np.array([
-							[i_a_x, i_a_y],
-							[i_a_x + int(item['anchor']['size']), i_a_y],
-							[i_a_x, i_a_y - int(item['anchor']['size'])],
-							[i_a_x + int(item['anchor']['size']), i_a_y - int(item['anchor']['size'])]
-							])
+	return (x, y, h, w)
 
-		pts_dst = np.array([
-							[a_x, a_y],
-							[a_x + a_width, a_y],
-							[a_x, a_y - a_height],
-							[a_x + a_width, a_y - a_height]
-							])
+def extract_roi_from_job(item, detected_anchor, orientation):
+	if 'roi_box' in item and 'anchor' in item:
+		""" Get item context """
+		item_box = json.loads(item['anchor']['box'])
+		np_item_box = np.asarray(item_box)
 
-		h, status = cv2.findHomography(pts_src, pts_dst)
+		current_anchor_box = detected_anchor
 
+		h, status = cv2.findHomography(np_item_box, current_anchor_box)
+
+		""" Build counter rotation matrix (we already rotated image) """
+		cancel_rotation_angle = 90 - orientation
+		theta = np.radians(cancel_rotation_angle)
+		c, s = np.cos(theta), np.sin(theta)
+
+		R = np.array((
+				(c, s, 0),
+				(-s, c, 0),
+				(0, 0, 1)
+		))
 
 		"""
 		h = np.array([
@@ -537,39 +489,22 @@ def extract_roi_from_job(item, detected_anchor):
 							[0, 1, 0],
 							[0, 0, 1]
 							])
-		print(h)
 		"""
-		final_1 = h @ rect_1
-		final_2 = h @ rect_2
+		""" Get item ROI """
+		item_roi_box = json.loads(item['roi_box'])
+		np_item_roi_box = np.asarray(item_roi_box)
 
-		final_1 = filter_out_negatives_and_out_of_bound(final_1, (1000, 2000))
-		final_2 = filter_out_negatives_and_out_of_bound(final_2, (1000, 2000))
+		""" Create destination matrix """
+		homo_coords = np.zeros((4,2))
+		i = 0
 
-		x1, y1, x2, y2 = final_1[0], final_1[1], final_2[0], final_2[1]
+		for x,y in np_item_roi_box:
+			""" Compute transformation """
+			res = R @ h @ (x,y,0)
+			homo_coords[i] = res[0:2]
+			i = i + 1
 
-		#print("From " + str((r_x1, r_y1, r_x2, r_y2)))
-		#print("To " + str((int(x1), int(y1), int(x2), int(y2))))
-
-	return (int(x1), int(y1), int(x2), int(y2))
-
-def rotate_point(point, center, angle):
-	x, y = point
-	cx, cy = center
-	theta = np.radians(angle)
-
-	""" Translate to origen """
-	trans_X = x - cx;
-	trans_Y = y - cy;
-
-	""" Rotate """
-	rot_X = trans_X*np.cos(theta) - trans_Y*np.sin(theta);
-	rot_Y = trans_X*np.sin(theta) + trans_Y*np.cos(theta);
-
-	""" Back to position """
-	x = rot_X + cx;
-	y = rot_Y + cy;
-
-	return (x , y)
+	return abs(homo_coords)
 
 def filter_out_negatives_and_out_of_bound(array, bounds):
 	""" Replace negatives with 0 """
